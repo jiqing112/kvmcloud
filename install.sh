@@ -34,7 +34,7 @@ CPU_RATIO="4"; MEM_RATIO="1.5"; DISK_RATIO="2"; BW_RATIO="1"
 #   JOIN_TOKEN              agent 模式必填（或 --token 传入）
 #   AGENT_NIC_BANDWIDTH_KBPS 节点物理网卡速率，默认自动探测
 VERSION="v0.1.0"
-REPO_RAW="https://github.com/kvm-cloud/platform/releases/download/${VERSION}"
+REPO_RAW="https://github.com/ojoti/kvmcloud/releases/download/${VERSION}"
 
 usage() {
     cat <<EOF
@@ -90,6 +90,14 @@ detect_pkg() {
     else echo "unknown"; fi
 }
 
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64)  echo "amd64" ;;
+        aarch64) echo "arm64" ;;
+        *)       echo "unsupported" ;;
+    esac
+}
+
 install_deps_control() {
     local pkg; pkg=$(detect_pkg)
     info "安装控制面依赖（PostgreSQL/Redis/NATS）[${pkg}]"
@@ -134,7 +142,9 @@ install_deps_only() { install_deps_control; install_deps_agent; }
 
 fetch_binary() {
     local name="$1" dest="$2"
-    local url="${REPO_RAW}/kvmcloud-${name}_linux_amd64.tar.gz"
+    local arch; arch=$(detect_arch)
+    [[ "$arch" != "unsupported" ]] || die "不支持的 CPU 架构：$(uname -m)（发布含 amd64/arm64）"
+    local url="${REPO_RAW}/kvmcloud-${name}_linux_${arch}.tar.gz"
     info "下载 ${url}"
     curl -fsSL --retry 3 -o "/tmp/${name}.tar.gz" "$url" || die "下载失败：$url（也可 make build 后手动拷贝 bin/）"
     tar -xzf "/tmp/${name}.tar.gz" -C /usr/local/bin/
