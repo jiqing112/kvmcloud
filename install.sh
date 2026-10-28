@@ -33,7 +33,7 @@ CPU_RATIO="4"; MEM_RATIO="1.5"; DISK_RATIO="2"; BW_RATIO="1"
 #   CONTROL_JOIN_TOKEN      节点注册令牌（control/all-in-one 生成侧）
 #   JOIN_TOKEN              agent 模式必填（或 --token 传入）
 #   AGENT_NIC_BANDWIDTH_KBPS 节点物理网卡速率，默认自动探测
-VERSION="v0.1.0"
+VERSION="v0.1.1"
 REPO_RAW="https://github.com/ojoti/kvmcloud/releases/download/${VERSION}"
 
 usage() {
