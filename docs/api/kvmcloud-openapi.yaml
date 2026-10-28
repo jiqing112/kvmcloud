@@ -1,0 +1,877 @@
+openapi: 3.0.3
+info:
+  title: KVMCloud Open API
+  version: 0.1.0
+  description: |
+    KVMCloud 云主机全生命周期 REST API（四维超开 KVM 公有云平台）。
+
+    ## 通用约定
+
+    - **鉴权**：所有租户接口要求 `Authorization: Bearer <Tenant_API_Key>`；
+      API Key 明文仅在创建时展示一次，服务端只保存 SHA-256 摘要。
+    - **异步处理**：凡涉及底层资源变更的操作（创建、变配、重装、开关机、IP 增减、流量包）
+      统一返回 `202 Accepted` 与 `task_id`，响应头 `Location: /api/v1/tasks/{task_id}`，
+      客户端轮询 `GET /api/v1/tasks/{task_id}` 获取进度。
+    - **带宽策略**：所有涉及网络的操作均支持 KVMCloud 独创的 `PortBandwidthPolicy`
+      对象——`min_kbps` 保障带宽（参与四维超开 BW 维度预留）、`max_kbps` 借用上限、
+      `shared_pool_id` 共享带宽池、`priority` 抢占优先级（数值越大越优先，抢占时压回低优先级端口）。
+    - **四维超开调度**：创建与变配在控制面同步完成 CPU/内存/磁盘/带宽保障 四维超开校验
+      并预扣节点容量与租户配额；校验失败同步返回 409，通过后才投递异步任务给 Agent。
+    - **幂等**：可选请求头 `Idempotency-Key`（≤64 字符），同一租户 + Key 24h 内去重。
+    - **错误模型**：统一 `Error` 对象，`code` 为机器可读错误码（见 Error schema 描述）。
+
+externalDocs:
+  description: 后端实现与接线说明
+  url: https://github.com/kvm-cloud/platform/tree/main/docs/api
+
+servers:
+  - url: https://api.kvmcloud.example.com
+    description: 生产控制面
+  - url: http://localhost:8080
+    description: 本地开发
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: VMs
+    description: 云主机创建、查询、变配与删除
+  - name: Actions
+    description: 电源与系统操作（开关机、重启、重置密码、重装）
+  - name: IPs
+    description: 网络扩展：弹性 IP 绑定 / 解绑
+  - name: Traffic Packages
+    description: 流量计费增值业务
+  - name: Tasks
+    description: 异步任务轮询
+
+paths:
+  /vms:
+    post:
+      tags: [VMs]
+      summary: 创建云主机
+      operationId: createVM
+      description: |
+        创建一台云主机。**同步阶段**完成：带宽策略校验（min_kbps ≤ max_kbps 等）→
+        套餐/自定义规格解析 → 租户配额预扣 → 调度器四维超开校验（CPU/内存/磁盘/带宽保障，
+        原子 UPDATE 防并发竞态）→ 落库 VM / VNIC / 带宽策略；**异步阶段**（NATS 任务 `vm.create`）：
+        调度节点上的 Agent 建 VM、应用 QoS（tc htb 保障 + 借用上限）、分配 IP、回写地址。
+
+        失败补偿：任一同步步骤失败时按序回滚（策略/VNIC/VM 行 → 节点四维预留 → 租户配额）。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVMRequest'
+            examples:
+              customSpec:
+                summary: 自定义规格 + 独享保障带宽
+                value:
+                  name: web-01
+                  image_id: img-debian12-x64
+                  vcpus: 4
+                  memory_mb: 8192
+                  disk_gb: 80
+                  network_id: net-7f3a
+                  bandwidth_policy:
+                    min_kbps: 51200
+                    max_kbps: 1024000
+                    priority: 100
+                  enable_ipv6: true
+                  disk_iops_limit: 20000
+                  ssh_keys: ["ssh-ed25519 AAAA... me@laptop"]
+              flavorSpec:
+                summary: 套餐 + 共享池借用
+                value:
+                  name: bench-02
+                  image_id: img-ubuntu2404-x64
+                  flavor_id: flavor-2c2g
+                  network_id: net-7f3a
+                  bandwidth_policy:
+                    min_kbps: 0
+                    max_kbps: 2048000
+                    shared_pool_id: pool-01hx5k
+                    priority: 60
+      responses:
+        '202':
+          description: 已受理，同步校验与配额预扣完成，异步任务已投递
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskAccepted'
+              example:
+                task_id: 9b2f4d5e-8a1c-4c3e-b7a9-2e6f1d0c8b45
+                kind: vm.create
+                state: pending
+                vm_id: 5f0e1d2c-3b4a-4968-8776-665544332211
+                created_at: '2026-10-28T08:30:00Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/InsufficientCapacity' }
+        '503': { $ref: '#/components/responses/NoNodeAvailable' }
+    get:
+      tags: [VMs]
+      summary: 查询云主机列表
+      operationId: listVMs
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/VMStatus' }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: 云主机列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/VM' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /vms/{vm_id}:
+    parameters:
+      - $ref: '#/components/parameters/VMId'
+    get:
+      tags: [VMs]
+      summary: 查询云主机详情（含地址与带宽策略）
+      operationId: getVM
+      responses:
+        '200':
+          description: 云主机详情
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VM' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [VMs]
+      summary: 删除云主机（释放四维预留与租户配额）
+      operationId: deleteVM
+      description: 异步销毁：Agent 删除域与 QoS → 控制面释放节点四维预留、租户配额与带宽策略 → 回收 IP。
+      responses:
+        '202':
+          description: 已受理
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /vms/{vm_id}/resize:
+    post:
+      tags: [VMs]
+      summary: 变更配置 / 扩容
+      operationId: resizeVM
+      description: |
+        变更 vCPU / 内存 / 磁盘，并可选实时调整带宽策略（保障带宽、上限或优先级）。
+
+        - **磁盘仅允许扩容**（new_disk_gb > 当前值），缩容返回 422 `disk_shrink_not_allowed`。
+        - 变更重新触发调度器四维超开校验：先按旧规格释放节点预留，再按新规格原子预留；
+          新规格预留失败时自动回补旧规格（补偿事务），不会出现容量悬空。
+        - 运行态变更 vCPU/内存时任务负载携带 `allow_hot_plug` 提示，Agent 评估热插拔；
+          不支持热插拔的组合自动转入冷迁移 / 短暂关机窗口（任务 kind 仍为 `vm.resize`，
+          进度中体现 `cold_migrate` 阶段）。
+        - 同一 VM 存在 pending/running 任务时返回 409 `task_in_progress`。
+      parameters:
+        - $ref: '#/components/parameters/VMId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResizeVMRequest'
+            example:
+              new_vcpus: 8
+              new_memory_mb: 16384
+              new_disk_gb: 160
+              bandwidth_policy:
+                min_kbps: 102400
+                max_kbps: 2048000
+                priority: 100
+      responses:
+        '202':
+          description: 已受理，重新预留完成，热插拔/冷迁移任务已投递
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskAccepted' }
+              example:
+                task_id: 1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+                kind: vm.resize
+                state: pending
+                vm_id: 5f0e1d2c-3b4a-4968-8776-665544332211
+                created_at: '2026-10-28T09:12:40Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InsufficientCapacity' }
+        '422': { $ref: '#/components/responses/DiskShrink' }
+
+  /vms/{vm_id}/ips:
+    parameters:
+      - $ref: '#/components/parameters/VMId'
+    post:
+      tags: [IPs]
+      summary: 申请并绑定 IP（网络扩展）
+      operationId: addVMIPs
+      description: |
+        为云主机追加 IP。`bandwidth_policy` 可为新 IP 绑定独立带宽策略（缺省共享 VM 主策略）；
+        独立策略同样遵循 min_kbps ≤ max_kbps 约束，且 min 计入 BW 维度预留。
+        异步任务 `ip.attach`：分配地址 → Agent 热挂第二网卡/添加地址 → 应用独立 QoS → 回写。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddIPsRequest' }
+      responses:
+        '202':
+          description: 已受理
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InsufficientCapacity' }
+    get:
+      tags: [IPs]
+      summary: 查询云主机 IP 列表
+      operationId: listVMIPs
+      responses:
+        '200':
+          description: IP 列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/IPAddress' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /vms/{vm_id}/ips/{ip_address}:
+    delete:
+      tags: [IPs]
+      summary: 解绑并释放 IP
+      operationId: removeVMIP
+      description: 主 IP（type=primary）不可解绑，返回 422。异步任务 `ip.detach`：Agent 摘除地址与 QoS → 控制面回收地址池。
+      parameters:
+        - $ref: '#/components/parameters/VMId'
+        - name: ip_address
+          in: path
+          required: true
+          schema: { type: string, format: ipv4 }
+      responses:
+        '202':
+          description: 已受理
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/BadRequest' }
+
+  /vms/{vm_id}/traffic-packages:
+    parameters:
+      - $ref: '#/components/parameters/VMId'
+    post:
+      tags: [Traffic Packages]
+      summary: 购买并绑定流量包（流量计费）
+      operationId: attachTrafficPackage
+      description: |
+        购买流量包并绑定到该云主机。同步阶段调用计费引擎扣费（余额不足返回 402/409）；
+        异步任务 `traffic.attach`：更新该 VM 的流量抵扣策略（优先扣流量包、超出后按量计费），
+        并同步 Agent 更新流量采集配额与上报周期。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AttachTrafficPackageRequest' }
+      responses:
+        '202':
+          description: 扣费成功，抵扣策略更新任务已投递
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: 余额不足或套餐不可售（billing_failed / package_unavailable）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      tags: [Traffic Packages]
+      summary: 查询已绑定流量包与用量
+      operationId: listVMTrafficPackages
+      responses:
+        '200':
+          description: 流量包列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TrafficPackage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /vms/{vm_id}/actions/start:
+    post:
+      tags: [Actions]
+      summary: 开机
+      operationId: startVM
+      description: 运行中重复开机返回 409 `invalid_state`。任务 `vm.power`（payload.action=start）。
+      parameters:
+        - $ref: '#/components/parameters/VMId'
+      responses:
+        '202': { $ref: '#/components/responses/TaskAcceptedOnly' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InvalidState' }
+  /vms/{vm_id}/actions/stop:
+    post:
+      tags: [Actions]
+      summary: 关机
+      operationId: stopVM
+      description: 默认软关机（ACPI），Agent 等待超时后硬断电。任务 `vm.power`（payload.action=stop）。
+      parameters:
+        - $ref: '#/components/parameters/VMId'
+      responses:
+        '202': { $ref: '#/components/responses/TaskAcceptedOnly' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InvalidState' }
+  /vms/{vm_id}/actions/reboot:
+    post:
+      tags: [Actions]
+      summary: 重启
+      operationId: rebootVM
+      description: 软重启；`?hard=true` 强制硬重启。任务 `vm.power`（payload.action=reboot）。
+      parameters:
+        - $ref: '#/components/parameters/VMId'
+        - name: hard
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAcceptedOnly' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InvalidState' }
+  /vms/{vm_id}/actions/reset-password:
+    post:
+      tags: [Actions]
+      summary: 重置密码
+      operationId: resetVMPassword
+      description: |
+        不传 password 时由控制面生成随机密码并经加密通道（gRPC mTLS）下发 Agent 注入，
+        一次性通过任务 result 返回明文；建议立即修改。任务 `vm.reset_password`。
+      parameters:
+        - $ref: '#/components/parameters/VMId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResetPasswordRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAcceptedOnly' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InvalidState' }
+  /vms/{vm_id}/actions/reinstall:
+    post:
+      tags: [Actions]
+      summary: 重装系统
+      operationId: reinstallVM
+      description: |
+        指定新 image_id 重装系统盘（数据盘保留）。任务 `vm.reinstall`：
+        停机 → 重置系统盘 → 按镜像重注cloud-init/密码 → 回到原带宽策略与 IP。
+        运行中的 VM 先自动软关机。镜像不存在返回 400 `image_not_found`。
+      parameters:
+        - $ref: '#/components/parameters/VMId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReinstallRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/TaskAcceptedOnly' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InvalidState' }
+
+  /tasks/{task_id}:
+    get:
+      tags: [Tasks]
+      summary: 查询异步任务进度
+      operationId: getTask
+      description: |
+        任务状态机：`pending → running → succeeded | failed`。
+        建议轮询间隔 2s（指数退避至 10s）；`state=succeeded` 后读 `result`，
+        `state=failed` 后读 `error`。任务仅保留 7 天。
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 任务详情
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+              examples:
+                running:
+                  summary: 创建进行中
+                  value:
+                    task_id: 9b2f4d5e-8a1c-4c3e-b7a9-2e6f1d0c8b45
+                    kind: vm.create
+                    state: running
+                    progress: 60
+                    vm_id: 5f0e1d2c-3b4a-4968-8776-665544332211
+                    created_at: '2026-10-28T08:30:00Z'
+                    updated_at: '2026-10-28T08:30:42Z'
+                succeeded:
+                  summary: 变配成功
+                  value:
+                    task_id: 1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+                    kind: vm.resize
+                    state: succeeded
+                    progress: 100
+                    vm_id: 5f0e1d2c-3b4a-4968-8776-665544332211
+                    result:
+                      hot_plug: true
+                      vcpus: 8
+                      memory_mb: 16384
+                      disk_gb: 160
+                      bandwidth_policy:
+                        min_kbps: 102400
+                        max_kbps: 2048000
+                        priority: 100
+                    created_at: '2026-10-28T09:12:40Z'
+                    updated_at: '2026-10-28T09:14:03Z'
+                failed:
+                  summary: 创建失败（带宽保障不足）
+                  value:
+                    task_id: 0f1e2d3c-4b5a-6978-8776-112233445566
+                    kind: vm.create
+                    state: failed
+                    progress: 30
+                    error:
+                      code: insufficient_bandwidth
+                      message: min_kbps 预留失败：抢占低优先级端口后仍不足
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        租户 API Key。`Authorization: Bearer <Tenant_API_Key>`；
+        服务端仅存 SHA-256 摘要，常量时间比对。
+
+  parameters:
+    VMId:
+      name: vm_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, maxLength: 64 }
+      description: 幂等键；同一租户内 24h 去重，重复请求返回首个任务的 task_id。
+
+  headers:
+    Location:
+      description: 任务轮询地址
+      schema: { type: string, example: /api/v1/tasks/9b2f4d5e-8a1c-4c3e-b7a9-2e6f1d0c8b45 }
+
+  responses:
+    TaskAcceptedOnly:
+      description: 已受理
+      headers:
+        Location: { $ref: '#/components/headers/Location' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/TaskAccepted' }
+    BadRequest:
+      description: 参数错误（含 min_kbps > max_kbps、镜像/套餐不存在）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: invalid_bandwidth_policy
+            message: min_kbps(102400) 不得超过 max_kbps(51200)
+    Unauthorized:
+      description: API Key 缺失或无效
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: unauthorized, message: missing or invalid bearer token }
+    Forbidden:
+      description: 资源不属于当前租户
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: forbidden, message: vm not owned by tenant }
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: vm_not_found, message: not found }
+    InsufficientCapacity:
+      description: 容量/配额/状态冲突（四维超开不足、配额超限、任务互斥、状态非法）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            overcommit:
+              value:
+                code: insufficient_capacity
+                message: overcommit exceeded
+                details: { dimension: mem, alloc: 61440, need: 16384, limit: 73728 }
+            taskInProgress:
+              value: { code: task_in_progress, message: vm has an active task }
+    DiskShrink:
+      description: 语义不可满足（磁盘缩容、解绑主 IP 等）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: disk_shrink_not_allowed, message: new_disk_gb(40) 小于当前 disk_gb(80)，仅允许扩容 }
+    InvalidState:
+      description: VM 当前状态不允许该操作
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: invalid_state, message: vm is already running }
+    NoNodeAvailable:
+      description: 无可用在线节点，任务未能投递（配额已回滚，可直接重试）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: no_node_available, message: no online node satisfies the request }
+
+  schemas:
+    PortBandwidthPolicySpec:
+      type: object
+      description: |
+        端口带宽策略（请求侧）。KVMCloud 差异化带宽模型：
+        `min_kbps` 为**保障带宽**，参与调度器 BW 维度预留与共享池容量扣减；
+        `max_kbps` 为**借用上限**（突发天花板），仅在共享池有富余时生效；
+        `priority` 数值越大越优先，池紧张时优先压回低 priority 端口（0 回收）。
+      required: [max_kbps]
+      properties:
+        min_kbps:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: 保障带宽（Kbps）。>0 时独享保障（计入节点 NIC 四维预留）或入池保障（计入池容量）。
+        max_kbps:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 借用/突发上限（Kbps），必须 ≥ min_kbps。
+        shared_pool_id:
+          type: string
+          nullable: true
+          description: 共享带宽池 ID。提供时 min_kbps 计入池的 allocated_min_kbps；未提供时仅独享保障。
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 100
+          description: 抢占优先级。
+      example:
+        min_kbps: 51200
+        max_kbps: 1024000
+        shared_pool_id: null
+        priority: 100
+
+    PortBandwidthPolicy:
+      type: object
+      description: 端口带宽策略（控制面落库后的完整视图）。
+      allOf:
+        - $ref: '#/components/schemas/PortBandwidthPolicySpec'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            vnic_id: { type: string, format: uuid }
+            direction:
+              type: string
+              enum: [ingress, egress]
+            state:
+              type: string
+              enum: [guaranteed, borrowing, preempted]
+            current_ceil_kbps:
+              type: integer
+              format: int64
+              nullable: true
+              description: 借用仲裁后实际生效的上限（可能小于 max_kbps）。
+            created_at: { type: string, format: date-time }
+
+    CreateVMRequest:
+      type: object
+      description: |
+        创建请求。规格二选一：`flavor_id`（套餐定价）或自定义 `vcpus/memory_mb/disk_gb`；
+        二者同时提供时以 flavor_id 为准。
+      required: [name, image_id, network_id]
+      properties:
+        name:
+          type: string
+          maxLength: 64
+          pattern: '^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
+        image_id: { type: string, example: img-debian12-x64 }
+        flavor_id: { type: string, example: flavor-2c2g }
+        vcpus: { type: integer, minimum: 1, maximum: 64 }
+        memory_mb: { type: integer, format: int64, minimum: 512, maximum: 1048576 }
+        disk_gb: { type: integer, format: int64, minimum: 10, maximum: 16384 }
+        network_id: { type: string, example: net-7f3a }
+        bandwidth_policy: { $ref: '#/components/schemas/PortBandwidthPolicySpec' }
+        enable_ipv6:
+          type: boolean
+          default: false
+          description: 分配 IPv6 地址（SLAAC）。
+        disk_iops_limit:
+          type: integer
+          format: int64
+          minimum: 0
+          description: 磁盘 IOPS 上限；0 表示不限。
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 128
+          description: 初始 root 密码；与 ssh_keys 二选一，都不传则生成随机密码。
+        ssh_keys:
+          type: array
+          maxItems: 20
+          items: { type: string }
+        node_id:
+          type: string
+          format: uuid
+          description: 可选指定宿主节点；缺省由调度器选择四维水位最低的在线节点。
+      oneOf:
+        - required: [flavor_id]
+          title: 套餐规格
+        - required: [vcpus, memory_mb, disk_gb]
+          title: 自定义规格
+
+    ResizeVMRequest:
+      type: object
+      description: |
+        变配请求。四个字段至少传一个（minProperties=1）；未传字段保持不变。
+        new_disk_gb 仅允许大于当前值。
+      minProperties: 1
+      properties:
+        new_vcpus: { type: integer, minimum: 1, maximum: 64 }
+        new_memory_mb: { type: integer, format: int64, minimum: 512, maximum: 1048576 }
+        new_disk_gb:
+          type: integer
+          format: int64
+          minimum: 10
+          maximum: 16384
+          description: 仅允许扩容；小于当前值返回 422 disk_shrink_not_allowed。
+        bandwidth_policy:
+          $ref: '#/components/schemas/PortBandwidthPolicySpec'
+          description: 可选；实时调整保障带宽、借用上限或优先级，Agent 在线更新 tc 规则，无需停机。
+
+    AddIPsRequest:
+      type: object
+      required: [ip_version]
+      properties:
+        ip_version:
+          type: string
+          enum: [ipv4, ipv6]
+        count:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+        bandwidth_policy:
+          $ref: '#/components/schemas/PortBandwidthPolicySpec'
+          description: 可选；为新 IP 绑定独立带宽策略，缺省与主网卡共享同一策略。
+
+    IPAddress:
+      type: object
+      properties:
+        ip_address: { type: string, example: 203.0.113.10 }
+        ip_version: { type: string, enum: [ipv4, ipv6] }
+        type: { type: string, enum: [primary, secondary] }
+        bandwidth_policy:
+          $ref: '#/components/schemas/PortBandwidthPolicy'
+          nullable: true
+          description: 独立策略；为空表示与主网卡共享。
+        created_at: { type: string, format: date-time }
+
+    AttachTrafficPackageRequest:
+      type: object
+      required: [package_id]
+      properties:
+        package_id:
+          type: string
+          description: 流量包商品 ID（目录表 traffic_packages）。
+          example: tpp-1tb-90d
+        auto_renew:
+          type: boolean
+          default: false
+          description: 用尽后自动续购（余额不足则不续并告警）。
+
+    TrafficPackage:
+      type: object
+      properties:
+        package_id: { type: string }
+        total_bytes: { type: integer, format: int64 }
+        used_bytes: { type: integer, format: int64 }
+        expire_at: { type: string, format: date-time, nullable: true }
+        auto_renew: { type: boolean }
+        state: { type: string, enum: [active, exhausted, expired] }
+
+    ResetPasswordRequest:
+      type: object
+      properties:
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 128
+          description: 缺省时生成随机密码。
+
+    ReinstallRequest:
+      type: object
+      required: [image_id]
+      properties:
+        image_id: { type: string, example: img-ubuntu2404-x64 }
+        ssh_keys:
+          type: array
+          items: { type: string }
+          description: 可选；覆盖镜像内置 key。
+
+    VMStatus:
+      type: string
+      enum: [creating, running, stopped, deleting, error]
+      description: deleting 为删除任务进行中。
+
+    VMAddress:
+      type: object
+      properties:
+        ip_address: { type: string }
+        ip_version: { type: string, enum: [ipv4, ipv6] }
+        type: { type: string, enum: [primary, secondary] }
+
+    VM:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        name: { type: string }
+        image_id: { type: string }
+        flavor_id: { type: string, nullable: true }
+        vcpus: { type: integer }
+        memory_mb: { type: integer, format: int64 }
+        disk_gb: { type: integer, format: int64 }
+        status: { $ref: '#/components/schemas/VMStatus' }
+        network_id: { type: string }
+        enable_ipv6: { type: boolean }
+        disk_iops_limit: { type: integer, format: int64 }
+        addresses:
+          type: array
+          items: { $ref: '#/components/schemas/VMAddress' }
+        bandwidth_policy: { $ref: '#/components/schemas/PortBandwidthPolicy' }
+        active_task_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: 该 VM 当前进行中的任务；为空表示无互斥任务。
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    TaskKind:
+      type: string
+      enum: [vm.create, vm.resize, vm.power, vm.reset_password, vm.reinstall, ip.attach, ip.detach, traffic.attach, qos.update]
+
+    TaskState:
+      type: string
+      enum: [pending, running, succeeded, failed]
+
+    TaskAccepted:
+      type: object
+      required: [task_id, kind, state]
+      properties:
+        task_id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/TaskKind' }
+        state: { $ref: '#/components/schemas/TaskState' }
+        vm_id: { type: string, format: uuid, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    Task:
+      type: object
+      required: [task_id, kind, state, progress]
+      properties:
+        task_id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/TaskKind' }
+        state: { $ref: '#/components/schemas/TaskState' }
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: 阶段化进度：创建任务 10=已投递 30=域已建 60=QoS 已应用 90=地址已回写 100=完成。
+        vm_id: { type: string, format: uuid, nullable: true }
+        result:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: succeeded 后的任务产物（如 addresses、hot_plug）。
+        error:
+          allOf: [{ $ref: '#/components/schemas/Error' }]
+          nullable: true
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            机器可读错误码全集：
+            `unauthorized` / `forbidden` / `invalid_request` / `invalid_bandwidth_policy` /
+            `image_not_found` / `flavor_not_found` / `vm_not_found` / `task_not_found` / `task_in_progress` /
+            `invalid_state` / `disk_shrink_not_allowed` / `insufficient_capacity`（四维超开不足）/
+            `insufficient_bandwidth`（抢占后仍不足） / `quota_exceeded` / `no_node_available` /
+            `billing_failed` / `package_unavailable` / `rate_limited` / `internal_error`。
+        message: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: 结构化上下文（如超开命中的维度与水位）。
