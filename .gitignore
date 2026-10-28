@@ -1,0 +1,27 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Runtime config (keep *.example)
+config/*.env
+!config/*.env.example
+
+# Logs / local state
+*.log
+/data/
+
+# Coverage
+*.out
+coverage.html
+
+# Editors
+.idea/
+.vscode/
+
+# Local security-audit cache
+.mimosa/

@@ -1,0 +1,40 @@
+version: 2
+
+project_name: kvmcloud
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: control
+    main: ./cmd/control
+    binary: kvmcloud-control
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+  - id: agent
+    main: ./cmd/agent
+    binary: kvmcloud-agent
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+
+archives:
+  - formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

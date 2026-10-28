@@ -1,0 +1,19 @@
+[Unit]
+Description=KVM Cloud Compute Agent (register/heartbeat/QoS)
+After=network-online.target libvirtd.service cloud-control.service
+Wants=network-online.target
+# 同机形态：控制面未就绪时不启动；分机形态 cloud-control.service 不存在，
+# systemd 忽略不存在的 After= 单元，故分机亦可正常启动。
+Requires=libvirtd.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/cloud/agent.env
+ExecStart=/usr/local/bin/kvmcloud-agent
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=KVM Cloud Control Plane (HTTP API + gRPC registry + monitor)
+After=network-online.target postgresql.service
+Wants=network-online.target
+# all-in-one 形态下 agent 依赖本服务
+Before=cloud-agent.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/cloud/control.env
+ExecStart=/usr/local/bin/kvmcloud-control
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package cloud.v1;
+
+option go_package = "github.com/kvm-cloud/platform/internal/pb/cloudv1;cloudv1";
+
+// ---------------------------------------------------------------------------
+// 节点注册与心跳
+// ---------------------------------------------------------------------------
+
+// NodeService 控制面对 Agent 暴露的节点生命周期接口。
+service NodeService {
+  // Register 节点注册：校验 JOIN_TOKEN，幂等（同 node_name 返回已有 ID）。
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  // Heartbeat 心跳：上报资源快照，控制面据此刷新 allocated/physical 与水位告警。
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message RegisterRequest {
+  string token = 1;          // JOIN_TOKEN，主控生成，可设有效期/一次性
+  string node_name = 2;      // 默认取 hostname，可由 --node-name 覆盖
+  string hostname = 3;
+  string ip = 4;             // Agent 出口 IP（服务端从连接获取时留空）
+  int32 physical_vcpus = 5;
+  int64 physical_mem_mb = 6;
+  int64 physical_disk_gb = 7;
+  int64 physical_nic_bandwidth_kbps = 8;
+  double cpu_ratio = 9;      // Agent 侧安装时指定的超开比，覆盖控制面默认
+  double mem_ratio = 10;
+  double disk_ratio = 11;
+  double bw_ratio = 12;
+}
+
+message RegisterResponse {
+  string node_id = 1;
+  bool created = 2;          // true=新建，false=幂等命中已有节点
+  string control_http_addr = 3; // 供 Agent 日志提示
+}
+
+message ResourceSnapshot {
+  int32 physical_vcpus = 1;
+  int64 physical_mem_mb = 2;
+  int64 physical_disk_gb = 3;
+  int64 physical_nic_bandwidth_kbps = 4;
+  // 实际使用（用于水位与气球决策）
+  double vcpu_used_percent = 5;
+  int64 mem_used_mb = 6;
+  int64 balloon_reclaimable_mb = 7;
+  int64 disk_used_gb = 8;
+  int64 thin_pool_used_gb = 9;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  string token = 2;          // 注册成功后下发的心跳凭据（注册时返回 token 派生值）
+  ResourceSnapshot snapshot = 3;
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+  // 控制面下发的四维超开水位（0~1），Agent 本地日志可打印
+  double cpu_watermark = 2;
+  double mem_watermark = 3;
+  double disk_watermark = 4;
+  double bw_watermark = 5;
+}
+
+// ---------------------------------------------------------------------------
+// 带宽 QoS 下发
+// ---------------------------------------------------------------------------
+
+// QoSService 控制面把端口策略变更（新建/借用授予/抢占压回/回收）下发 Agent。
+service QoSService {
+  // ApplyPolicy 全量应用端口策略（TC HTB rate+ceil）。
+  rpc ApplyPolicy(ApplyPolicyRequest) returns (ApplyPolicyResponse);
+  // UpdateCeil 仅调整 ceil（借用授予/抢占压回时的高频路径）。
+  rpc UpdateCeil(UpdateCeilRequest) returns (UpdateCeilResponse);
+}
+
+message ApplyPolicyRequest {
+  string node_id = 1;
+  string vnic_id = 2;
+  string iface = 3;          // tap 设备名
+  int64 min_kbps = 4;
+  int64 max_kbps = 5;
+}
+
+message ApplyPolicyResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message UpdateCeilRequest {
+  string node_id = 1;
+  string vnic_id = 2;
+  string iface = 3;
+  int64 new_ceil_kbps = 4;
+}
+
+message UpdateCeilResponse {
+  bool ok = 1;
+  string error = 2;
+}
