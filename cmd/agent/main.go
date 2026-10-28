@@ -87,6 +87,10 @@ func main() {
 	runner := agentlib.ExecRunner{}
 	collector := &agentlib.Collector{R: runner}
 
+	// 物理带宽：env 覆盖 > 网卡协商速率 > 1Gbps 缺省（启动时定，注册与心跳一致）
+	nicKbps := agentlib.ResolveNICBandwidthKbps(envOr("AGENT_NIC", ""), envInt64("AGENT_NIC_BANDWIDTH_KBPS", 0))
+	log.Info("nic bandwidth resolved", "kbps", nicKbps)
+
 	// --- 注册（幂等，重试到成功） ---
 	nodeID := ""
 	for {
@@ -97,17 +101,17 @@ func main() {
 			continue
 		}
 		resp, err := nodeClient.Register(ctx, &cloudv1.RegisterRequest{
-			Token:                  joinToken,
-			NodeName:               nodeName,
-			Hostname:               hostname(),
-			PhysicalVcpus:          snap.PhysicalVCPUs,
-			PhysicalMemMb:          snap.PhysicalMemMB,
-			PhysicalDiskGb:         snap.PhysicalDiskGB,
-			PhysicalNicBandwidthKbps: orVal(envInt64("AGENT_NIC_BANDWIDTH_KBPS", 0), agentlib.IfaceSpeedKbps(envOr("AGENT_NIC", "eth0"))),
-			CpuRatio:               envFloat("CPU_RATIO", 4.0),
-			MemRatio:               envFloat("MEM_RATIO", 1.5),
-			DiskRatio:              envFloat("DISK_RATIO", 2.0),
-			BwRatio:                envFloat("BW_RATIO", 1.0),
+			Token:                    joinToken,
+			NodeName:                 nodeName,
+			Hostname:                 hostname(),
+			PhysicalVcpus:            snap.PhysicalVCPUs,
+			PhysicalMemMb:            snap.PhysicalMemMB,
+			PhysicalDiskGb:           snap.PhysicalDiskGB,
+			PhysicalNicBandwidthKbps: nicKbps,
+			CpuRatio:                 envFloat("CPU_RATIO", 4.0),
+			MemRatio:                 envFloat("MEM_RATIO", 1.5),
+			DiskRatio:                envFloat("DISK_RATIO", 2.0),
+			BwRatio:                  envFloat("BW_RATIO", 1.0),
 		})
 		if err != nil {
 			log.Warn("register retry", "err", err)
@@ -155,15 +159,15 @@ func main() {
 				NodeId: nodeID,
 				Token:  joinToken,
 				Snapshot: &cloudv1.ResourceSnapshot{
-					PhysicalVcpus:          snap.PhysicalVCPUs,
-					PhysicalMemMb:          snap.PhysicalMemMB,
-					PhysicalDiskGb:         snap.PhysicalDiskGB,
-					PhysicalNicBandwidthKbps: envInt64("AGENT_NIC_BANDWIDTH_KBPS", 0),
-					VcpuUsedPercent:        snap.VCPUUsedPercent,
-					MemUsedMb:              snap.MemUsedMB,
-					BalloonReclaimableMb:   snap.BalloonReclaimableMB,
-					DiskUsedGb:             snap.DiskUsedGB,
-					ThinPoolUsedGb:         snap.ThinPoolUsedGB,
+					PhysicalVcpus:            snap.PhysicalVCPUs,
+					PhysicalMemMb:            snap.PhysicalMemMB,
+					PhysicalDiskGb:           snap.PhysicalDiskGB,
+					PhysicalNicBandwidthKbps: nicKbps,
+					VcpuUsedPercent:          snap.VCPUUsedPercent,
+					MemUsedMb:                snap.MemUsedMB,
+					BalloonReclaimableMb:     snap.BalloonReclaimableMB,
+					DiskUsedGb:               snap.DiskUsedGB,
+					ThinPoolUsedGb:           snap.ThinPoolUsedGB,
 				},
 			})
 			if err != nil {
@@ -183,13 +187,6 @@ func main() {
 			}
 		}
 	}
-}
-
-func orVal(v, alt int64) int64 {
-	if v != 0 {
-		return v
-	}
-	return alt
 }
 
 func hostname() string {

@@ -345,6 +345,37 @@ func (s *Store) SetNodeStatus(ctx context.Context, nodeID, status string) error 
 	return nil
 }
 
+// UpdateNodeCapacity 重注册时回填节点物理容量与超开比（仅非零/合法值生效，防采集缺失清库）。
+func (s *Store) UpdateNodeCapacity(ctx context.Context, nodeID string, n *model.Node) error {
+	upd := qb.Update("nodes")
+	if n.PhysicalVCPUs > 0 {
+		upd = upd.Set("physical_vcpus", n.PhysicalVCPUs)
+	}
+	if n.PhysicalMemMB > 0 {
+		upd = upd.Set("physical_mem_mb", n.PhysicalMemMB)
+	}
+	if n.PhysicalDiskGB > 0 {
+		upd = upd.Set("physical_disk_gb", n.PhysicalDiskGB)
+	}
+	if n.PhysicalNICBwKbps > 0 {
+		upd = upd.Set("physical_nic_bandwidth_kbps", n.PhysicalNICBwKbps)
+	}
+	if n.CPUOvercommitRatio >= 1 {
+		upd = upd.Set("cpu_overcommit_ratio", n.CPUOvercommitRatio)
+	}
+	if n.MemOvercommitRatio >= 1 {
+		upd = upd.Set("mem_overcommit_ratio", n.MemOvercommitRatio)
+	}
+	if n.DiskOvercommitRatio >= 1 {
+		upd = upd.Set("disk_overcommit_ratio", n.DiskOvercommitRatio)
+	}
+	if n.BWOvercommitRatio >= 1 {
+		upd = upd.Set("bw_overcommit_ratio", n.BWOvercommitRatio)
+	}
+	_, err := upd.Where(sq.Eq{"id": nodeID}).RunWith(s.db).ExecContext(ctx)
+	return err
+}
+
 // --------------------------------------------------------------------------
 // Tenants / VMs / VNICs
 // --------------------------------------------------------------------------

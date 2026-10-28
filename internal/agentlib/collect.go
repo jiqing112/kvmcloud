@@ -28,7 +28,7 @@ type HostSnapshot struct {
 	ThinPoolUsedGB      int64
 }
 
-// Collect 采集物理容量（不含带宽——带宽由安装期配置/接口速率决定）。
+// Collect 采集物理容量与实际使用。
 func (c *Collector) Collect() (*HostSnapshot, error) {
 	s := &HostSnapshot{}
 	nproc, err := c.R.Run("nproc")
@@ -49,19 +49,61 @@ func (c *Collector) Collect() (*HostSnapshot, error) {
 	s.MemUsedMB = (memTotal - memAvail) / 1024
 	s.BalloonReclaimableMB = memAvail / 1024 // 可回收近似：当前可用页
 
-	dfOut, err := c.R.Run("df", "-BG", "--output=size,used", "/var/lib/kvmcloud")
+	// 磁盘：优先平台数据目录，不存在则回退根分区
+	target := "/var/lib/kvmcloud"
+	if _, statErr := os.Stat(target); statErr != nil {
+		target = "/"
+	}
+	dfOut, err := c.R.Run("df", "-BG", "--output=size,used", target)
 	if err == nil {
-		// 解析第二行：size|used
 		lines := strings.Split(strings.TrimSpace(dfOut), "\n")
 		if len(lines) >= 2 {
 			fields := strings.Fields(lines[1])
 			if len(fields) == 2 {
 				s.PhysicalDiskGB = parseGB(fields[0])
 				s.DiskUsedGB = parseGB(fields[1])
+				s.ThinPoolUsedGB = s.DiskUsedGB
 			}
 		}
 	}
 	return s, nil
+}
+
+// AutoDetectNIC 返回第一个非 lo 网卡名（/sys/class/net 枚举）。
+func AutoDetectNIC() string {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if e.Name() != "lo" {
+			return e.Name()
+		}
+	}
+	return ""
+}
+
+// ResolveNICBandwidthKbps 决定节点物理带宽：显式 env > 网卡协商速率 > 1Gbps 缺省。
+// virtio 设备的 speed 可能读到 -1/Unknown，一律按 0 处理并走缺省。
+func ResolveNICBandwidthKbps(configuredIface string, configuredKbps int64) int64 {
+	if configuredKbps > 0 {
+		return configuredKbps
+	}
+	iface := configuredIface
+	if iface == "" || !nicExists(iface) {
+		iface = AutoDetectNIC()
+	}
+	if iface != "" {
+		if kbps := IfaceSpeedKbps(iface); kbps > 0 {
+			return kbps
+		}
+	}
+	return 1_000_000 // 缺省 1 Gbps，可在 agent.env 用 AGENT_NIC_BANDWIDTH_KBPS 覆盖
+}
+
+func nicExists(iface string) bool {
+	_, err := os.Stat("/sys/class/net/" + iface)
+	return err == nil
 }
 
 func parseGB(s string) int64 {
@@ -117,11 +159,15 @@ func (c *Collector) SetBalloonTarget(domain string, targetMB int64) error {
 }
 
 // IfaceSpeedKbps 读取网卡协商速率（/sys/class/net/<iface>/speed，Mbps→kbps）。
+// 读不到或为负（virtio Unknown）返回 0，由调用方走缺省。
 func IfaceSpeedKbps(iface string) int64 {
 	b, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/speed", iface))
 	if err != nil {
 		return 0
 	}
 	mbps, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if mbps < 0 {
+		return 0
+	}
 	return mbps * 1000
 }

@@ -97,15 +97,16 @@ func (s *Server) Register(ctx context.Context, req *cloudv1.RegisterRequest) (*c
 		n.BWOvercommitRatio = 1.0
 	}
 
-	// 幂等：先查同名节点
+	// 幂等：先查同名节点；存在则回填最新上报的物理容量/超开比（非零值生效）
 	if existing, err := s.st.GetNodeByName(ctx, n.Hostname); err == nil {
-		n.ID = existing.ID
-		n.CreatedAt = existing.CreatedAt
-		// 物理容量与超开比以最新上报为准（重装/扩容场景）
-		if err := s.st.CreateNode(ctx, n); err != nil {
+		if err := s.st.UpdateNodeCapacity(ctx, existing.ID, n); err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
-		return s.response(ctx, n, false), nil
+		merged, gerr := s.st.GetNode(ctx, existing.ID)
+		if gerr != nil {
+			return nil, status.Error(codes.Internal, gerr.Error())
+		}
+		return s.response(ctx, merged, false), nil
 	} else if err != store.ErrNotFound {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
