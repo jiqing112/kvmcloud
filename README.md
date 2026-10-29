@@ -91,7 +91,7 @@ docs/deploy.md       部署指南（含 API 示例与故障排查）
 ```
 ## 赞助者
 
-九霄云-买服务器就找九霄云
+[九霄云](https://idc.jiuxiaoyunidc.top/)-买服务器就找九霄云
 
 ## License
 
