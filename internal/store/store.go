@@ -432,13 +432,70 @@ func (s *Store) UpdateVMStatus(ctx context.Context, id, status string) error {
 	return nil
 }
 
+// ListPendingVMs 列出节点上等待建机的 VM（status=creating，FIFO，供 Agent 拉取）。
+func (s *Store) ListPendingVMs(ctx context.Context, nodeID string) ([]*model.VM, error) {
+	rows, err := qb.Select("id", "tenant_id", "node_id", "name", "flavor", "vcpus", "mem_mb", "disk_gb", "status", "error", "created_at").
+		From("vms").
+		Where(sq.Eq{"node_id": nodeID, "status": model.VMStatusCreating}).
+		OrderBy("created_at ASC").
+		RunWith(s.db).QueryContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.VM
+	for rows.Next() {
+		var v model.VM
+		if err := rows.Scan(&v.ID, &v.TenantID, &v.NodeID, &v.Name, &v.Flavor, &v.VCPUs, &v.MemMB, &v.DiskGB, &v.Status, &v.Error, &v.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &v)
+	}
+	return out, rows.Err()
+}
+
+// SetVMError 建机失败：置 error 状态并记录原因（供 UI 展示）。
+func (s *Store) SetVMError(ctx context.Context, id, msg string) error {
+	res, err := qb.Update("vms").Set("status", model.VMStatusError).Set("error", msg).
+		Where(sq.Eq{"id": id}).RunWith(s.db).ExecContext(ctx)
+	if err != nil {
+		return err
+	}
+	if rowsAffected(res) == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetVMPolicyKbps 查询 VM 主网卡的 egress 带宽策略（min/max Kbps）。
+// 无策略（创建时未配置带宽）返回 hasPolicy=false。
+func (s *Store) GetVMPolicyKbps(ctx context.Context, vmID string) (minKbps, maxKbps int64, hasPolicy bool, err error) {
+	rows, err := qb.Select("p.min_kbps", "p.max_kbps").
+		From("port_bandwidth_policies p").
+		Join("vnics v ON v.id = p.vnic_id").
+		Where(sq.Eq{"v.vm_id": vmID, "p.direction": "egress"}).
+		Limit(1).
+		RunWith(s.db).QueryContext(ctx)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return 0, 0, false, rows.Err()
+	}
+	if err := rows.Scan(&minKbps, &maxKbps); err != nil {
+		return 0, 0, false, err
+	}
+	return minKbps, maxKbps, true, nil
+}
+
 // GetVM 查询 VM。
 func (s *Store) GetVM(ctx context.Context, id string) (*model.VM, error) {
 	var v model.VM
-	err := qb.Select("id", "tenant_id", "node_id", "name", "flavor", "vcpus", "mem_mb", "disk_gb", "status", "created_at").
+	err := qb.Select("id", "tenant_id", "node_id", "name", "flavor", "vcpus", "mem_mb", "disk_gb", "status", "error", "created_at").
 		From("vms").Where(sq.Eq{"id": id}).
 		RunWith(s.db).QueryRowContext(ctx).
-		Scan(&v.ID, &v.TenantID, &v.NodeID, &v.Name, &v.Flavor, &v.VCPUs, &v.MemMB, &v.DiskGB, &v.Status, &v.CreatedAt)
+		Scan(&v.ID, &v.TenantID, &v.NodeID, &v.Name, &v.Flavor, &v.VCPUs, &v.MemMB, &v.DiskGB, &v.Status, &v.Error, &v.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -450,7 +507,7 @@ func (s *Store) GetVM(ctx context.Context, id string) (*model.VM, error) {
 
 // ListVMs VM 列表（nodeID 传空串时不过滤）。
 func (s *Store) ListVMs(ctx context.Context, nodeID string) ([]*model.VM, error) {
-	sel := qb.Select("id", "tenant_id", "node_id", "name", "flavor", "vcpus", "mem_mb", "disk_gb", "status", "created_at").
+	sel := qb.Select("id", "tenant_id", "node_id", "name", "flavor", "vcpus", "mem_mb", "disk_gb", "status", "error", "created_at").
 		From("vms")
 	if nodeID != "" {
 		sel = sel.Where(sq.Eq{"node_id": nodeID})
@@ -463,7 +520,7 @@ func (s *Store) ListVMs(ctx context.Context, nodeID string) ([]*model.VM, error)
 	var out []*model.VM
 	for rows.Next() {
 		var v model.VM
-		if err := rows.Scan(&v.ID, &v.TenantID, &v.NodeID, &v.Name, &v.Flavor, &v.VCPUs, &v.MemMB, &v.DiskGB, &v.Status, &v.CreatedAt); err != nil {
+		if err := rows.Scan(&v.ID, &v.TenantID, &v.NodeID, &v.Name, &v.Flavor, &v.VCPUs, &v.MemMB, &v.DiskGB, &v.Status, &v.Error, &v.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, &v)

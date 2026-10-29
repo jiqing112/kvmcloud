@@ -26,7 +26,10 @@
         <td>{{ v.name }}</td>
         <td class="mono">{{ v.vcpus }}c / {{ (v.mem_mb/1024).toFixed(0) }}G / {{ v.disk_gb }}G</td>
         <td class="mono">{{ short(v.node_id) }}</td>
-        <td><span class="tag" :class="v.status === 'running' ? 'ok' : v.status === 'creating' ? 'warn' : ''">{{ v.status }}</span></td>
+        <td>
+          <span class="tag" :class="statusClass(v.status)" :title="v.error || ''">{{ v.status }}</span>
+          <div class="muted" v-if="v.error" style="max-width:260px;white-space:normal;">{{ v.error }}</div>
+        </td>
         <td class="muted">{{ new Date(v.created_at).toLocaleString() }}</td>
       </tr>
     </tbody>
@@ -35,7 +38,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { api } from '../api.js'
 
 const vms = ref([]), pools = ref([])
@@ -43,7 +46,9 @@ const placing = ref(false), error = ref('')
 const form = ref({ tenant_name: 'default', name: '', vcpus: 2, mem_mb: 4096, disk_gb: 40, min_kbps: 0, max_kbps: 0, shared_pool_id: '' })
 
 const short = (id) => (id || '').slice(0, 8)
+const statusClass = (s) => (s === 'running' ? 'ok' : s === 'creating' ? 'warn' : s === 'error' ? 'bad' : '')
 
+let timer = null
 async function load() {
   const [vs, ps] = await Promise.all([api.get('/api/v1/vms'), api.get('/api/v1/pools')])
   vms.value = vs || []; pools.value = ps || []
@@ -58,5 +63,9 @@ async function place() {
     error.value = e.data && e.data.code === 'overcommit_exceeded' ? `超开超限：${e.message}` : e.message
   } finally { placing.value = false }
 }
-onMounted(load)
+onMounted(() => {
+  load()
+  timer = setInterval(load, 5000) // 建机/变配状态轮询
+})
+onUnmounted(() => { if (timer) clearInterval(timer) })
 </script>

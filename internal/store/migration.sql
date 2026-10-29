@@ -115,3 +115,6 @@ CREATE TABLE IF NOT EXISTS overcommit_alerts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_alerts_node ON overcommit_alerts(node_id, created_at DESC);
+
+-- v0.2.1: 建机任务回写与失败原因
+ALTER TABLE vms ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT '';

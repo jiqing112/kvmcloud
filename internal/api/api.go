@@ -59,6 +59,10 @@ func (s *Server) Router() *gin.Engine {
 		api.GET("/vms/:id", s.getVM)
 		api.POST("/vms/:id/status", s.setVMStatus)
 
+		// Agent 内部 API：建机任务拉取与结果回报（见 agent.go）
+		api.GET("/agent/tasks/pending", s.agentPendingTasks)
+		api.POST("/agent/tasks/report", s.agentReportTask)
+
 		// 共享带宽池
 		api.POST("/pools", s.createPool)
 		api.GET("/pools", s.listPools)

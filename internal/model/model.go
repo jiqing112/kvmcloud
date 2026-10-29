@@ -69,6 +69,7 @@ type VM struct {
 	MemMB     int64     `json:"mem_mb"`
 	DiskGB    int64     `json:"disk_gb"`
 	Status    string    `json:"status"`
+	Error     string    `json:"error,omitempty"` // 建机失败原因（status=error 时）
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -156,6 +157,7 @@ const (
 	VMStatusCreating = "creating"
 	VMStatusRunning  = "running"
 	VMStatusStopped  = "stopped"
+	VMStatusError    = "error"
 	VMStatusDeleted  = "deleted"
 
 	PolicyStateGuaranteed = "guaranteed"

@@ -43,6 +43,8 @@ func (ExecRunner) Run(name string, args ...string) (string, error) {
 		return combined(exec.Command("tc", args...))
 	case "virsh":
 		return combined(exec.Command("virsh", args...))
+	case "qemu-img":
+		return combined(exec.Command("qemu-img", args...))
 	case "nproc":
 		return combined(exec.Command("nproc"))
 	case "df":

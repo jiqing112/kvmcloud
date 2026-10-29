@@ -1,13 +1,15 @@
 // kvmcloud-agent 计算节点 Agent：
 //  1. 启动时用 JOIN_TOKEN 向主控注册（幂等）；
 //  2. 周期心跳上报资源快照，回执水位；
-//  3. 订阅 gRPC QoS 下发（ApplyPolicy/UpdateCeil）→ TC HTB。
+//  3. 周期拉取建机任务 → qemu-img/virsh 建机 + TC QoS → 回报结果；
+//  4. gRPC QoS 反向下发（ApplyPolicy/UpdateCeil）为后续演进项。
 // 配置仅从环境变量读取；凭据不落盘（systemd EnvironmentFile 权限 0600）。
 package main
 
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -125,6 +127,24 @@ func main() {
 
 	// --- QoS 下发服务（Agent 侧 gRPC server 由控制面反向调用在后续版本演进；
 	//     当前版本 Agent 轮询控制面 HTTP 获取 pending 变更，保持简单可靠） ---
+
+	// --- 建机任务循环：拉取本节点 pending → qemu-img/virsh 建机 → 回报结果 ---
+	controlHTTP := envOr("CONTROL_HTTP_ADDR", deriveHTTPAddr(controlAddr, envOr("CONTROL_HTTP_PORT", "8080")))
+	prov := &agentlib.Provisioner{
+		R:         runner,
+		DataDir:   envOr("AGENT_DATA_DIR", "/var/lib/kvmcloud"),
+		BaseImage: os.Getenv("AGENT_BASE_IMAGE"),
+		Bridge:    envOr("AGENT_BRIDGE", "virbr0"),
+	}
+	log.Info("provisioner ready", "control_http", controlHTTP, "base_image", prov.BaseImage, "bridge", prov.Bridge)
+	provInterval := 10 * time.Second
+	if v := os.Getenv("PROVISION_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			provInterval = d
+		}
+	}
+	pc := &provisionClient{http: &http.Client{Timeout: 120 * time.Second}, baseURL: controlHTTP, nodeID: nodeID}
+	go runProvisionLoop(ctx, log, pc, prov, provInterval)
 
 	// --- 心跳循环 ---
 	heartbeatInterval := 15 * time.Second
