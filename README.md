@@ -89,7 +89,10 @@ web/                 Vue3 控制台
 install.sh           三形态安装/卸载
 docs/deploy.md       部署指南（含 API 示例与故障排查）
 ```
+## 以下是赞助者
 
+<img width="1254" height="1254" alt="image" src="https://github.com/user-attachments/assets/299d10ff-78eb-4e77-8757-131060ce8d48" />
+九霄云-买服务器就找九霄云
 ## License
 
 Apache-2.0
