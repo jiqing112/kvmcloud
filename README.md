@@ -93,7 +93,7 @@ docs/deploy.md       部署指南（含 API 示例与故障排查）
 
 [九霄云](https://idc.jiuxiaoyunidc.top/)-买服务器就找九霄云
 ![佛系云](.github/666576ed39582674ac58cedce2fbc406.png)
-[佛系云](idc.idcfx.com)-轻松上云自营/合作资源主打一体化云资源
+[佛系云](https://idc.idcfx.com/)-轻松上云自营/合作资源主打一体化云资源
 
 ## License
 
