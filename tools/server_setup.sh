@@ -15,7 +15,7 @@ apt-get install -y -qq git curl openssl >/dev/null
 
 log "step 2/5: 克隆仓库"
 if [ ! -d /root/kvmcloud/.git ]; then
-    git clone --depth 1 https://github.com/ojoti/kvmcloud.git /root/kvmcloud
+    git clone --depth 1 https://gitee.com/yuntianojo/kvmcloud.git /root/kvmcloud
 else
     git -C /root/kvmcloud pull --ff-only || true
 fi

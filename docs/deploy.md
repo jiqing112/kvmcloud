@@ -20,7 +20,7 @@
 方式 B —— 源码编译：
 
 ```bash
-git clone https://github.com/ojoti/kvmcloud.git kvmcloud
+git clone https://gitee.com/yuntianojo/kvmcloud.git kvmcloud
 cd kvmcloud && make build
 # 产物：bin/kvmcloud-control  bin/kvmcloud-agent
 ```
