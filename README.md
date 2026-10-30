@@ -78,6 +78,13 @@ cd web && npm ci && npm run build   # 控制台（Vue3 + Vite）
 前端六个页面：仪表盘（四维水位总览）/ 节点（超开比调优）/ 虚拟机（放置）/
 带宽策略（借用/回收/事件）/ 共享池 / 水位告警。
 
+## 自动更新
+
+`kvmcloud-control` / `kvmcloud-agent` 内置自更新（默认开启）：定时检测
+Gitee/GitHub 双通道新版本 → `checksums.txt` SHA-256 校验下载 → 原子替换二进制
+→ `systemctl restart` + 健康探测，失败自动回滚旧版。`KC_AUTO_UPDATE=check` 仅检测告警，
+`off` 关闭；详见 [docs/deploy.md](docs/deploy.md#6-本体自动更新)。
+
 ## 安全设计
 
 - **源码零 SQL 文本**：语句经 squirrel 构建器生成，参数一律绑定占位符；DDL 为内嵌静态文件。

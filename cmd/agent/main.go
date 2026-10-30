@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,6 +22,7 @@ import (
 
 	cloudv1 "github.com/kvm-cloud/platform/internal/pb/cloudv1"
 	"github.com/kvm-cloud/platform/internal/agentlib"
+	"github.com/kvm-cloud/platform/internal/updater"
 )
 
 var (
@@ -66,6 +68,11 @@ func envBool(key string, def bool) bool {
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(log)
+
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Printf("kvmcloud-agent %s (commit %s)\n", version, commit)
+		return
+	}
 
 	controlAddr := os.Getenv("CONTROL_ADDR")
 	joinToken := os.Getenv("JOIN_TOKEN")
@@ -145,6 +152,15 @@ func main() {
 	}
 	pc := &provisionClient{http: &http.Client{Timeout: 120 * time.Second}, baseURL: controlHTTP, nodeID: nodeID}
 	go runProvisionLoop(ctx, log, pc, prov, provInterval)
+
+	// --- 本体自动更新：定时检测新版本，auto 模式后台自更新（失败自动回滚） ---
+	selfUpdate, err := updater.FromEnv("agent", version, "cloud-agent.service", log)
+	if err != nil {
+		log.Warn("auto update disabled", "err", err)
+	} else if selfUpdate != nil {
+		go selfUpdate.Run(ctx)
+		log.Info("auto updater enabled", "mode", "on")
+	}
 
 	// --- 心跳循环 ---
 	heartbeatInterval := 15 * time.Second

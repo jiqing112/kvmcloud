@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"github.com/kvm-cloud/platform/internal/grpcserver"
 	"github.com/kvm-cloud/platform/internal/monitor"
 	"github.com/kvm-cloud/platform/internal/store"
+	"github.com/kvm-cloud/platform/internal/updater"
 )
 
 var (
@@ -51,6 +53,11 @@ func envDur(key string, def time.Duration) time.Duration {
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(log)
+
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Printf("kvmcloud-control %s (commit %s)\n", version, commit)
+		return
+	}
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
@@ -91,6 +98,15 @@ func main() {
 	}())
 
 	go mon.Run(ctx)
+
+	// --- 本体自动更新：定时检测新版本，auto 模式后台自更新（失败自动回滚） ---
+	selfUpdate, err := updater.FromEnv("control", version, "cloud-control.service", log)
+	if err != nil {
+		log.Warn("auto update disabled", "err", err)
+	} else if selfUpdate != nil {
+		go selfUpdate.Run(ctx)
+		log.Info("auto updater enabled", "mode", "on", "channel", os.Getenv("KC_UPDATE_CHANNEL"))
+	}
 
 	gs := grpcserver.New(st, mon, joinAuth, log)
 	go func() {

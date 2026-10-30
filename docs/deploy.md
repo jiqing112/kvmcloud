@@ -156,7 +156,38 @@ curl -X PUT http://127.0.0.1:8080/api/v1/nodes/<node-id>/ratios \
 
 ---
 
-## 6. 卸载
+## 6. 本体自动更新
+
+`kvmcloud-control` 与 `kvmcloud-agent` 内置自更新（`internal/updater`），默认开启：
+
+```bash
+# /etc/cloud/control.env / /etc/cloud/agent.env（0600）
+KC_AUTO_UPDATE=auto        # auto=后台自更新 | check=仅检测告警 | off=关闭
+KC_UPDATE_CHANNEL=auto     # auto=gitee 优先、失败回退 github | gitee | github
+KC_UPDATE_INTERVAL=6h      # 检测间隔（下限 10m）
+KC_UPDATE_JITTER=30m       # 首检随机延迟（防全节点雷群）
+```
+
+工作流程与安全约束：
+
+1. **检测**：拉取发布通道 `releases/latest`（Gitee API / GitHub API），跳过
+   draft/prerelease，tag 强校验（`vX.Y.Z`）；`dev` 本地构建不参与自动更新，禁止降级；
+2. **校验下载**：仅允许固定 https 主机族（gitee.com / github.com /
+   githubusercontent.com，重定向同样受白名单约束）；归档 SHA-256 与
+   `checksums.txt` 比对；下载 ≤512MiB / 解压 ≤512MiB / 单请求 15s 硬上限；
+3. **原子替换**：解压到二进制同目录（同文件系统保证 rename 原子性），旧版保留
+   为 `.bak`，rename 原子替换；
+4. **重启与健康探测**：`systemctl restart cloud-control|cloud-agent`（白名单执行器，
+   仅 is-active/restart 可达，timeout 强杀兜底）；is-active 探测 ≈10s；
+5. **回滚**：重启失败或服务未恢复 → 自动恢复 `.bak` 旧版并再次重启；
+   同一 tag 连续失败 3 次熔断，等待下一个新版本。
+
+注意：Agent 自更新发生在任务间隙之外不作特殊协调——建机任务具备幂等语义，
+重启后自动恢复；如需精确窗口，将 `KC_AUTO_UPDATE=check` 并手工择机重启。
+
+---
+
+## 7. 卸载
 
 ```bash
 sudo ./uninstall.sh agent    # 仅计算节点
@@ -166,7 +197,7 @@ sudo ./uninstall.sh all      # 全部
 
 ---
 
-## 7. 故障排查
+## 8. 故障排查
 
 | 现象 | 排查 |
 | --- | --- |
@@ -175,3 +206,4 @@ sudo ./uninstall.sh all      # 全部
 | 放置 409 overcommit_exceeded | 错误信息含维度名（cpu/mem/disk/bw），调超开比或换节点 |
 | 借用 409 | 抢占后仍不足（`denied`），查看 `/api/v1/events` |
 | 心跳断、节点 offline | 看门狗 90s 无心跳自动置 offline；恢复心跳自动回 online |
+| 自更新未生效 | 确认版本非 `dev`（本地构建不更新）；`journalctl -u cloud-control \| -u cloud-agent` 查 `auto update` 日志；Gitee 不可达时确认 `KC_UPDATE_CHANNEL` |
