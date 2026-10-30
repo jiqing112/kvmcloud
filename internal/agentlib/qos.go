@@ -1,9 +1,10 @@
-// Package agentlib Agent 侧执行：TC HTB QoS、资源采集、内存气球、KSM。
+// Package agentlib Agent 侧执行：TC HTB QoS、nftables NAT/安全组、资源采集、镜像管道。
 //
 // 命令执行安全模型：
 //   - 不经 shell：全部为参数列表执行；
-//   - 二进制白名单：仅 tc / virsh / nproc / df / free 五个命令可达，
-//     每个调用点的可执行文件名都是字符串字面量；
+//   - 二进制白名单：仅 tc / virsh / qemu-img / curl / genisoimage / nft / timeout /
+//     nproc / df / free 可达，每个调用点的可执行文件名都是字符串字面量；
+//   - 长时命令（下载/转换）经 timeout(1) 包裹（--kill-after 强杀），进程级硬超时；
 //   - 接口名白名单：iface 须匹配 [a-z0-9][a-z0-9._-]{0,14}（ValidateIface）；
 //   - 数值参数：仅接受 int64 格式化结果。
 package agentlib
@@ -49,6 +50,10 @@ func (ExecRunner) Run(name string, args ...string) (string, error) {
 		return combined(exec.Command("curl", args...))
 	case "genisoimage":
 		return combined(exec.Command("genisoimage", args...))
+	case "nft":
+		return combined(exec.Command("nft", args...))
+	case "timeout":
+		return combined(exec.Command("timeout", args...))
 	case "nproc":
 		return combined(exec.Command("nproc"))
 	case "df":

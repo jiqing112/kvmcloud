@@ -270,6 +270,35 @@ func (a *API) UpdateImageSource(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// DeleteImageSource DELETE /api/v1/image-sources/{id}：软禁用（保留 remote_images
+// 缓存与审计链路），不物理删除；平台级源对租户不可操作（RLS 0 行 → 404）。
+func (a *API) DeleteImageSource(c *gin.Context) {
+	p, ok := principal(c, "images:write", false)
+	if !ok {
+		return
+	}
+	sourceID, err := uuid.Parse(c.Param("id"))
+	if err != nil || sourceID == uuid.Nil {
+		fail(c, http.StatusBadRequest, "invalid_source_id")
+		return
+	}
+	var disabled bool
+	if !a.mutateTenantRow(c, p, func(tx *sql.Tx) error {
+		result, err := exec(c.Request.Context(), tx, query.Update("kvmcloud_core.image_sources").
+			Set("state", "disabled").
+			Where(sq.Eq{"id": sourceID.String(), "state": "active"}))
+		disabled, err = changed(result, err)
+		return err
+	}) {
+		return
+	}
+	if !disabled {
+		fail(c, http.StatusNotFound, "image_source_not_found")
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
 // SyncImageSources POST /api/v1/image-sources/{id}/sync
 // 入队 image.source.sync 任务 + outbox 事件；目录抓取与 upsert 由同步 worker 执行。
 func (a *API) SyncImageSources(c *gin.Context) {

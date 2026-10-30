@@ -1,12 +1,13 @@
 package coreapi
 
-// CreateVM：四维超开调度（模块 2）。
+// CreateVM：四维超开调度（模块 2）+ 镜像按需拉取（第二部分）。
 //
 // 全流程在单个 PostgreSQL 事务内完成（脚本化测试 creationSteps 逐条断言顺序）：
-//   set_config → active 租户校验 → 幂等键占用/重放 → 网络归属 → 镜像可见性/大小
-//   → 租户配额五维原子扣减 → [共享池保障余量] → 节点四维 FOR UPDATE SKIP LOCKED
-//   → 节点预留 → VM/NIC/QoS/预留/根卷 元数据 → task + outbox + audit
-//   → 幂等响应缓存 → COMMIT。
+//   set_config → active 租户校验 → 幂等键占用/重放 → 网络归属 → 镜像检查
+//   （image_id 直选 / image_source_name 本地可用 / 本地无镜像则登记 pending
+//    拉取并随 vm.create 任务链执行）→ 租户配额五维原子扣减 → [共享池保障余量]
+//   → 节点四维 FOR UPDATE SKIP LOCKED → 节点预留 → VM/NIC/QoS/预留/根卷 元数据
+//   → task + outbox + audit → 幂等响应缓存 → COMMIT。
 //
 // 锁顺序固定：tenant quota → shared pool → node（SKIP LOCKED）→ VM 元数据。
 // COMMIT 回执丢失是歧义状态：返回 503，客户端必须用原幂等键重试，绝不补偿。
@@ -50,14 +51,16 @@ func (b BandwidthSpec) valid() bool {
 
 type CreateVMRequest struct {
 	Name string `json:"name"`
-	// ImageID 与 ImageSourceName 二选一：UUID 直选已就绪镜像，
-	// 或镜像源规范名（local_images.name，须 available 且对本租户可见）。
-	ImageID         uuid.UUID     `json:"image_id"`
-	ImageSourceName string        `json:"image_source_name,omitempty"`
-	NetworkID       uuid.UUID     `json:"network_id"`
-	VCPUs           int64         `json:"vcpus"`
-	MemoryMiB       int64         `json:"memory_mib"`
-	RootDiskGiB     int64         `json:"root_disk_gib"`
+	// 三种镜像指定方式（互斥）：image_id 直选已就绪镜像；image_source_name 优先
+	// 命中本地可用镜像，未命中则解析可见远端镜像并自动拉取（返回 202 + task_id，
+	// Agent 先执行下载→校验→转换→注入，再建机）。
+	ImageID         uuid.UUID `json:"image_id"`
+	ImageSourceName string    `json:"image_source_name,omitempty"`
+	ImageOSType     string    `json:"image_os_type,omitempty"` // linux | windows（注入路径分叉）
+	NetworkID       uuid.UUID `json:"network_id"`
+	VCPUs           int64     `json:"vcpus"`
+	MemoryMiB       int64     `json:"memory_mib"`
+	RootDiskGiB     int64     `json:"root_disk_gib"`
 	Bandwidth       BandwidthSpec `json:"bandwidth"`
 }
 
@@ -65,12 +68,15 @@ func (r CreateVMRequest) valid() bool {
 	if !vmName.MatchString(r.Name) || r.NetworkID == uuid.Nil {
 		return false
 	}
-	// 恰好提供一种镜像指定方式：两者同给或都不给均拒绝。
+	// image_id 与 image_source_name 恰好提供一种：两者同给或都不给均拒绝。
 	if (r.ImageID != uuid.Nil) == (r.ImageSourceName != "") {
 		return false
 	}
 	if r.ImageSourceName != "" &&
 		(len(r.ImageSourceName) > imageSourceNameMax || !imageRefName.MatchString(r.ImageSourceName)) {
+		return false
+	}
+	if r.ImageOSType != "" && r.ImageOSType != "linux" && r.ImageOSType != "windows" {
 		return false
 	}
 	return r.VCPUs >= 1 && r.VCPUs <= 4096 && r.MemoryMiB >= 128 && r.MemoryMiB <= 16_777_216 &&
@@ -81,6 +87,8 @@ type Accepted struct {
 	VMID   uuid.UUID `json:"vm_id"`
 	TaskID uuid.UUID `json:"task_id"`
 	State  string    `json:"state"`
+	// ImagePullRequired=true 表示本请求触发了镜像自动拉取（前端据此切换提示）。
+	ImagePullRequired bool `json:"image_pull_required,omitempty"`
 }
 
 // CreateVM 提交配额、节点/池容量、VM 元数据、任务、outbox、幂等响应与审计于同一事务。
@@ -133,7 +141,7 @@ func (a *API) CreateVM(c *gin.Context) {
 		databaseError(c, err)
 		return
 	}
-	replayed, err := a.claimIdempotency(ctx, tx, c, p, key, hash)
+	replayed, err := a.claimIdempotency(ctx, tx, c, p, opCreateVM, key, hash)
 	if err != nil {
 		databaseError(c, err)
 		return
@@ -157,22 +165,53 @@ func (a *API) CreateVM(c *gin.Context) {
 
 	var imageID string
 	var imageSourceName any
+	var localImageID string
 	if request.ImageSourceName != "" {
-		// 规范名路径：本地镜像库中可用（available + 已知大小）且对租户可见。
+		imageSourceName = request.ImageSourceName
+		// 规范名路径：优先命中本地镜像库可用项（available + 已知大小 + 对租户可见）。
 		err = row(ctx, tx, query.Select("i.id").From("kvmcloud_core.local_images i").
 			Where(sq.Eq{"i.name": request.ImageSourceName, "i.pull_state": "available"}).
 			Where(sq.Or{sq.Eq{"i.tenant_id": nil}, sq.Eq{"i.tenant_id": p.TenantID.String()}}).
 			Where("i.size_bytes IS NOT NULL").
 			Suffix("FOR SHARE"), &imageID)
-		if errors.Is(err, sql.ErrNoRows) {
-			fail(c, http.StatusNotFound, "image_not_found_or_not_ready")
-			return
-		}
-		if err != nil {
+		switch {
+		case err == nil:
+			// 本地已有可用镜像，直接建机。
+		case errors.Is(err, sql.ErrNoRows):
+			// 本地无镜像：解析可见远端镜像（active 源 + 优先级序），登记 pending
+			// 拉取任务并随 vm.create 链执行——Agent 先跑 ImagePipeline 再建机。
+			// 全程返回 202 + task_id，前端轮询 GET /api/v1/tasks/{id}。
+			var remoteID, sourceID string
+			err = row(ctx, tx, query.Select("r.id", "r.source_id").
+				From("kvmcloud_core.remote_images r").
+				Join("kvmcloud_core.image_sources s ON s.id = r.source_id").
+				Where(sq.Eq{"r.name": request.ImageSourceName, "s.state": "active"}).
+				Where("s.tenant_id IS NULL OR s.tenant_id = ?", p.TenantID.String()).
+				OrderBy("s.priority", "r.last_seen_at DESC").Limit(1), &remoteID, &sourceID)
+			if errors.Is(err, sql.ErrNoRows) {
+				fail(c, http.StatusNotFound, "image_source_unresolvable")
+				return
+			}
+			if err != nil {
+				databaseError(c, err)
+				return
+			}
+			osType := request.ImageOSType
+			if osType == "" {
+				osType = "linux"
+			}
+			localImageID = uuid.NewString()
+			if _, err = exec(ctx, tx, query.Insert("kvmcloud_core.local_images").
+				Columns("id", "tenant_id", "source_id", "remote_image_id", "name", "os_type", "pull_state").
+				Values(localImageID, p.TenantID.String(), sourceID, remoteID,
+					request.ImageSourceName, osType, "pending")); err != nil {
+				databaseError(c, err)
+				return
+			}
+		default:
 			databaseError(c, err)
 			return
 		}
-		imageSourceName = request.ImageSourceName
 	} else {
 		err = row(ctx, tx, query.Select("id").From("kvmcloud_core.images").
 			Where(sq.Eq{"id": request.ImageID.String(), "state": "ready"}).
@@ -285,18 +324,19 @@ func (a *API) CreateVM(c *gin.Context) {
 	}
 	// Outbox 负载只含声明式标识与规格：无 SSH、无密码、无 shell、无任意 URL/路径。
 	payload, _, err := digestJSON(struct {
-		EventID      uuid.UUID       `json:"event_id"`
-		TaskID       uuid.UUID       `json:"task_id"`
-		TenantID     uuid.UUID       `json:"tenant_id"`
-		NodeID       string          `json:"node_id"`
-		VMID         uuid.UUID       `json:"vm_id"`
-		NICID        uuid.UUID       `json:"nic_id"`
-		RootVolumeID uuid.UUID       `json:"root_volume_id"`
-		Generation   int64           `json:"generation"`
-		Kind         string          `json:"kind"`
-		MAC          string          `json:"mac"`
-		Spec         CreateVMRequest `json:"spec"`
-	}{eventID, taskID, p.TenantID, nodeID, vmID, nicID, volumeID, 1, "vm.create", mac, request})
+		EventID         uuid.UUID       `json:"event_id"`
+		TaskID          uuid.UUID       `json:"task_id"`
+		TenantID        uuid.UUID       `json:"tenant_id"`
+		NodeID          string          `json:"node_id"`
+		VMID            uuid.UUID       `json:"vm_id"`
+		NICID           uuid.UUID       `json:"nic_id"`
+		RootVolumeID    uuid.UUID       `json:"root_volume_id"`
+		Generation      int64           `json:"generation"`
+		Kind            string          `json:"kind"`
+		MAC             string          `json:"mac"`
+		LocalImageID    string          `json:"local_image_id,omitempty"`
+		Spec            CreateVMRequest `json:"spec"`
+	}{eventID, taskID, p.TenantID, nodeID, vmID, nicID, volumeID, 1, "vm.create", mac, localImageID, request})
 	if err != nil {
 		fail(c, http.StatusInternalServerError, "serialization_failed")
 		return
@@ -312,15 +352,11 @@ func (a *API) CreateVM(c *gin.Context) {
 		databaseError(c, err)
 		return
 	}
-	response, _, err := digestJSON(Accepted{VMID: vmID, TaskID: taskID, State: "pending"})
-	if err != nil {
-		fail(c, http.StatusInternalServerError, "serialization_failed")
-		return
-	}
 	location := "/api/v1/tasks/" + taskID.String()
-	if _, err = exec(ctx, tx, query.Update("kvmcloud_core.idempotency_keys").
-		Set("response_status", http.StatusAccepted).Set("response_body", string(response)).
-		Set("location", location).Where(idempotencyWhere(p, opCreateVM, key))); err != nil {
+	response, err := a.cacheIdempotentResponse(ctx, tx, p, opCreateVM, key, location,
+		http.StatusAccepted, Accepted{VMID: vmID, TaskID: taskID, State: "pending",
+			ImagePullRequired: localImageID != ""})
+	if err != nil {
 		databaseError(c, err)
 		return
 	}
@@ -336,10 +372,10 @@ func (a *API) CreateVM(c *gin.Context) {
 // claimIdempotency 先 INSERT 占位（ON CONFLICT DO NOTHING）；命中已有键时锁定
 // 原行比较摘要并重放已提交响应。返回 replayed=true 表示响应已写出。
 func (a *API) claimIdempotency(ctx context.Context, tx *sql.Tx, c *gin.Context,
-	p Principal, key string, hash []byte) (bool, error) {
+	p Principal, operation, key string, hash []byte) (bool, error) {
 	result, err := exec(ctx, tx, query.Insert("kvmcloud_core.idempotency_keys").
 		Columns("tenant_id", "principal_id", "operation", "key", "request_sha256").
-		Values(p.TenantID.String(), p.ID.String(), opCreateVM, key, hash).
+		Values(p.TenantID.String(), p.ID.String(), operation, key, hash).
 		Suffix("ON CONFLICT DO NOTHING"))
 	inserted, err := changed(result, err)
 	if err != nil || inserted {
@@ -351,7 +387,7 @@ func (a *API) claimIdempotency(ctx context.Context, tx *sql.Tx, c *gin.Context,
 	var location sql.NullString
 	var expiresAt time.Time
 	err = row(ctx, tx, query.Select("request_sha256", "response_status", "response_body", "location", "expires_at").
-		From("kvmcloud_core.idempotency_keys").Where(idempotencyWhere(p, opCreateVM, key)).Suffix("FOR UPDATE"),
+		From("kvmcloud_core.idempotency_keys").Where(idempotencyWhere(p, operation, key)).Suffix("FOR UPDATE"),
 		&storedHash, &status, &response, &location, &expiresAt)
 	if err != nil {
 		return false, err

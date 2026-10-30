@@ -93,13 +93,28 @@ func (a *API) buildRouter() *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), a.identity())
 	v1 := r.Group("/api/v1")
+	v1.GET("/tasks/:id", a.GetTask)
 	v1.POST("/vms", a.CreateVM)
+	v1.POST("/vms/adopt", a.AdoptVMs)
+	v1.PUT("/vms/:id/bandwidth", a.SetVMBandwidth)
+	v1.POST("/vms/:id/port-forwardings", a.CreatePortForwarding)
+	v1.POST("/vms/:id/resize", a.ResizeVM)
+	v1.POST("/vms/:id/migrate", a.MigrateVM)
+	v1.DELETE("/vms/:id", a.DeleteVM)
+	v1.PUT("/vms/:id/security-groups", a.SetVMSecurityGroups)
 	v1.GET("/vms/:id/bandwidth-metrics", a.GetVMBandwidthMetrics)
+	v1.POST("/volumes/:id/snapshots", a.CreateSnapshot)
+	v1.GET("/nodes/:id/metrics", a.GetNodeMetrics)
+	v1.GET("/tenants/:id/quotas", a.GetTenantQuotas)
+	v1.POST("/tenants/:id/traffic-packages", a.BuyTrafficPackage)
+	v1.GET("/dashboard/summary", a.GetDashboardSummary)
+	v1.GET("/audit-logs", a.ListAuditLogs)
 	v1.POST("/nodes/install-token", a.GenerateInstallToken)
 	// 镜像源管理（模块 13）。
 	v1.GET("/image-sources", a.ListImageSources)
 	v1.POST("/image-sources", a.CreateImageSource)
 	v1.PUT("/image-sources/:id", a.UpdateImageSource)
+	v1.DELETE("/image-sources/:id", a.DeleteImageSource)
 	v1.POST("/image-sources/:id/sync", a.SyncImageSources)
 	v1.GET("/remote-images", a.ListRemoteImages)
 	v1.POST("/local-images/pull", a.PullLocalImage)
@@ -258,4 +273,18 @@ func digestJSON(v any) ([]byte, []byte, error) {
 func idempotencyWhere(p Principal, operation, key string) sq.Eq {
 	return sq.Eq{"tenant_id": p.TenantID.String(), "principal_id": p.ID.String(),
 		"operation": operation, "key": key}
+}
+
+// cacheIdempotentResponse 在提交前缓存成功响应（幂等重放源）。
+// location 指向异步任务轮询地址（或 201 资源地址）。调用方随后 Commit 并输出 body。
+func (a *API) cacheIdempotentResponse(ctx context.Context, tx *sql.Tx, p Principal,
+	operation, key, location string, status int, v any) ([]byte, error) {
+	body, _, err := digestJSON(v)
+	if err != nil {
+		return nil, err
+	}
+	_, err = exec(ctx, tx, query.Update("kvmcloud_core.idempotency_keys").
+		Set("response_status", status).Set("response_body", string(body)).
+		Set("location", location).Where(idempotencyWhere(p, operation, key)))
+	return body, err
 }
