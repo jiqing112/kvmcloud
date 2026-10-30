@@ -45,6 +45,10 @@ func (ExecRunner) Run(name string, args ...string) (string, error) {
 		return combined(exec.Command("virsh", args...))
 	case "qemu-img":
 		return combined(exec.Command("qemu-img", args...))
+	case "curl":
+		return combined(exec.Command("curl", args...))
+	case "genisoimage":
+		return combined(exec.Command("genisoimage", args...))
 	case "nproc":
 		return combined(exec.Command("nproc"))
 	case "df":

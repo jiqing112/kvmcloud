@@ -41,6 +41,15 @@
 
 ## 快速开始
 
+极客模式一行命令（两步式：下载后校验执行；自动识别发行版、换国内源、自动建库）：
+
+```bash
+curl -fsSL https://gitee.com/yuntianojo/kvmcloud/raw/main/install.sh -o /tmp/kvmcloud-install.sh \
+  && sudo bash /tmp/kvmcloud-install.sh all-in-one      # 或 control / agent --control-addr IP:9443 --token TOKEN
+```
+
+经典方式：
+
 ```bash
 # 单机全栈（开发/体验/小规模生产）
 export DATABASE_URL="postgres://kvmcloud:<密码>@127.0.0.1:5432/kvmcloud"
@@ -55,7 +64,7 @@ sudo ./install.sh agent --control-addr 10.0.0.10:9443 --token <JOIN_TOKEN> \
 
 三形态（all-in-one / control+多agent / agent-only）行为完全一致：
 依赖服务只装一份；Agent 不监听端口；端口规划 8080/9443/5432/6379/4222。
-完整步骤与验收见 [docs/deploy.md](docs/deploy.md)。
+完整步骤与验收见 [docs/deploy.md](docs/deploy.md)；功能全景见 [docs/features.md](docs/features.md)。
 
 ## 开发
 

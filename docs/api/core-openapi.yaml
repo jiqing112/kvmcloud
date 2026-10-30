@@ -1,0 +1,712 @@
+openapi: 3.0.3
+info:
+  title: KVMCloud Secure Core API
+  version: 1.0.0
+  description: |
+    Declarative control plane. No SSH credentials, passwords, arbitrary
+    commands, paths or XML. Async mutations use a transactional outbox.
+    This contract is independent of the legacy router.
+servers:
+  - url: https://api.kvmcloud.example/api/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: VMs
+  - name: Bandwidth
+  - name: Metrics
+  - name: Nodes
+  - name: Billing
+  - name: Network
+  - name: Storage
+  - name: Audit
+  - name: Tasks
+paths:
+  /vms:
+    post:
+      tags: [VMs]
+      operationId: createVM
+      summary: Atomically reserve four dimensions and enqueue creation
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateVM'}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /vms/{id}/bandwidth:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    put:
+      tags: [Bandwidth]
+      operationId: setVMBandwidth
+      summary: Replace the primary NIC egress policy
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BandwidthPolicy'}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /nodes/{id}/metrics:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      tags: [Metrics]
+      operationId: getNodeMetrics
+      summary: Platform-only aggregated node metrics; no Agent call
+      responses:
+        '200':
+          description: Cached physical and allocated resource samples
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NodeMetrics'}
+        default: {$ref: '#/components/responses/Error'}
+  /tenants/{id}/quotas:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      tags: [Metrics]
+      operationId: getTenantQuotas
+      summary: Current tenant only; cached quota projection
+      responses:
+        '200':
+          description: Aggregated limits and reservations
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/QuotaSnapshot'}
+        default: {$ref: '#/components/responses/Error'}
+  /vms/{id}/bandwidth-metrics:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      tags: [Metrics]
+      operationId: getVMBandwidthMetrics
+      summary: Authorize ownership, then read Redis only
+      responses:
+        '200':
+          description: kbps time series; absent data is not zero
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BandwidthMetrics'}
+        default: {$ref: '#/components/responses/Error'}
+  /dashboard/summary:
+    get:
+      tags: [Metrics]
+      operationId: getDashboardSummary
+      summary: Current-tenant aggregate read model
+      responses:
+        '200':
+          description: No host operations are initiated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Dashboard'}
+        default: {$ref: '#/components/responses/Error'}
+  /nodes/install-token:
+    post:
+      tags: [Nodes]
+      operationId: generateInstallToken
+      summary: Platform administrator only; 256-bit, single-use, 10-minute token
+      description: |
+        Never accepts SSH credentials. Returns a fixed HTTPS installer command
+        with a pinned script hash. Do not log, persist or cache this response.
+        This secret-issuing operation does not support idempotent response replay.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [cluster_id]
+              properties:
+                cluster_id: {$ref: '#/components/schemas/UUID'}
+                expected_spki_sha256:
+                  type: string
+                  pattern: '^[0-9a-f]{64}$'
+      responses:
+        '201':
+          description: One-time enrollment credential
+          headers:
+            Cache-Control:
+              schema: {type: string, enum: [no-store]}
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [issuance_id, node_id, cluster_id, expires_at, install_command]
+                properties:
+                  issuance_id: {$ref: '#/components/schemas/UUID'}
+                  node_id: {$ref: '#/components/schemas/UUID'}
+                  cluster_id: {$ref: '#/components/schemas/UUID'}
+                  expires_at: {type: string, format: date-time}
+                  install_command: {type: string, readOnly: true}
+        default: {$ref: '#/components/responses/Error'}
+  /tenants/{id}/traffic-packages:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      tags: [Billing]
+      operationId: purchaseTrafficPackages
+      summary: Server-side pricing and atomic wallet debit
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [product_id, quantity]
+              properties:
+                product_id: {$ref: '#/components/schemas/UUID'}
+                quantity: {type: integer, minimum: 1, maximum: 1000}
+      responses:
+        '201':
+          description: Order, package and immutable ledger committed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order_id, amount_minor, currency, packages]
+                properties:
+                  order_id: {$ref: '#/components/schemas/UUID'}
+                  amount_minor: {$ref: '#/components/schemas/UnsignedDecimal'}
+                  currency: {type: string, pattern: '^[A-Z]{3}$'}
+                  packages:
+                    type: array
+                    items: {$ref: '#/components/schemas/TrafficPackage'}
+        default: {$ref: '#/components/responses/Error'}
+    get:
+      tags: [Billing]
+      operationId: listTrafficPackages
+      summary: Same-tenant package balances, FIFO purchase order
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Package balances
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total_remaining_bytes]
+                properties:
+                  total_remaining_bytes: {$ref: '#/components/schemas/UnsignedDecimal'}
+                  next_cursor: {type: string, nullable: true}
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/TrafficPackage'}
+        default: {$ref: '#/components/responses/Error'}
+  /vms/{id}/port-forwardings:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      tags: [Network]
+      operationId: createPortForwarding
+      summary: Reserve a public socket and enqueue declarative DNAT
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PortForwardingInput'}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+    get:
+      tags: [Network]
+      operationId: listPortForwardings
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Forwarding states, not raw nftables rules
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  next_cursor: {type: string, nullable: true}
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [id, state, public_ip_id, protocol, external_port, internal_port]
+                      properties:
+                        id: {$ref: '#/components/schemas/UUID'}
+                        public_ip_id: {$ref: '#/components/schemas/UUID'}
+                        protocol: {type: string, enum: [tcp, udp]}
+                        external_port: {type: integer, minimum: 1, maximum: 65535}
+                        internal_port: {type: integer, minimum: 1, maximum: 65535}
+                        state:
+                          type: string
+                          enum: [pending, active, deleting, deleted, error]
+        default: {$ref: '#/components/responses/Error'}
+  /vms/{id}/port-forwardings/{forwarding_id}:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+      - name: forwarding_id
+        in: path
+        required: true
+        schema: {$ref: '#/components/schemas/UUID'}
+    delete:
+      tags: [Network]
+      operationId: deletePortForwarding
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /vms/{id}/resize:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      tags: [VMs]
+      operationId: resizeVM
+      summary: Reserve positive deltas; never shrink disks or silently power off
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [vcpus, memory_mib, root_disk_gib, allow_shutdown]
+              properties:
+                vcpus: {type: integer, minimum: 1, maximum: 4096}
+                memory_mib: {type: integer, minimum: 128, maximum: 16777216}
+                root_disk_gib: {type: integer, minimum: 1, maximum: 1048576}
+                allow_shutdown: {type: boolean, default: false}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /nodes/{id}/adoption-scans:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      tags: [Nodes]
+      operationId: scanAdoptableVMs
+      summary: Platform-only scan in an authorized target tenant context
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /vms/adopt:
+    post:
+      tags: [VMs]
+      operationId: adoptVM
+      summary: Adopt a scanned domain; never accept caller-supplied XML
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [node_id, scan_task_id, domain_uuid, network_id, name, bandwidth]
+              properties:
+                node_id: {$ref: '#/components/schemas/UUID'}
+                scan_task_id: {$ref: '#/components/schemas/UUID'}
+                domain_uuid: {$ref: '#/components/schemas/UUID'}
+                network_id: {$ref: '#/components/schemas/UUID'}
+                name: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'}
+                bandwidth: {$ref: '#/components/schemas/BandwidthPolicy'}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /vms/{id}/security-groups:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    put:
+      tags: [Network]
+      operationId: replaceVMSecurityGroups
+      summary: Atomically replace allow-rule groups; default deny
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [groups]
+              properties:
+                groups:
+                  type: array
+                  maxItems: 16
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [name, rules]
+                    properties:
+                      id: {$ref: '#/components/schemas/UUID'}
+                      name: {type: string, minLength: 1, maxLength: 128}
+                      rules:
+                        type: array
+                        maxItems: 256
+                        items: {$ref: '#/components/schemas/SecurityRule'}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /volumes/{id}/snapshots:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      tags: [Storage]
+      operationId: createVolumeSnapshot
+      summary: Create metadata and enqueue an Agent snapshot
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, consistency]
+              properties:
+                name: {type: string, minLength: 1, maxLength: 128}
+                consistency: {type: string, enum: [crash, filesystem]}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /vms/{id}/migrate:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      tags: [VMs]
+      operationId: migrateVM
+      summary: Reserve destination capacity before fenced live migration
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target_node_id, mode]
+              properties:
+                target_node_id: {$ref: '#/components/schemas/UUID'}
+                mode: {type: string, enum: [live]}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /vms/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    delete:
+      tags: [VMs]
+      operationId: recycleVM
+      summary: Soft delete; do not release reserved capacity until confirmed purge
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /vms/{id}/restore:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      tags: [VMs]
+      operationId: restoreVM
+      summary: Restore within retention period before purge starts
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        default: {$ref: '#/components/responses/Error'}
+  /audit-logs:
+    get:
+      tags: [Audit]
+      operationId: listAuditLogs
+      summary: Tenant-isolated append-only audit projection
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: from
+          in: query
+          schema: {type: string, format: date-time}
+        - name: to
+          in: query
+          schema: {type: string, format: date-time}
+        - name: action
+          in: query
+          schema: {type: string, maxLength: 128}
+        - name: resource_id
+          in: query
+          schema: {$ref: '#/components/schemas/UUID'}
+      responses:
+        '200':
+          description: Safe allowlisted audit metadata only
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  next_cursor: {type: string, nullable: true}
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/AuditLog'}
+        default: {$ref: '#/components/responses/Error'}
+  /tasks/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      tags: [Tasks]
+      operationId: getTask
+      summary: Current tenant only; never returns command payloads
+      responses:
+        '200':
+          description: Task state
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Task'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    ID:
+      name: id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UUID'}
+    Idempotency:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, pattern: '^[A-Za-z0-9._:-]{16,128}$'}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+    Cursor:
+      name: cursor
+      in: query
+      schema: {type: string, maxLength: 512}
+  responses:
+    Accepted:
+      description: Transaction committed; Agent execution is asynchronous
+      headers:
+        Location:
+          schema: {type: string}
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [task_id, state]
+            additionalProperties: false
+            properties:
+              vm_id: {$ref: '#/components/schemas/UUID'}
+              task_id: {$ref: '#/components/schemas/UUID'}
+              state: {type: string, enum: [pending]}
+    Error:
+      description: |
+        400 malformed JSON/UUID/idempotency key; 401 unauthenticated;
+        403 missing scope; 404 absent or different-tenant resource;
+        409 quota/capacity/state/port/idempotency conflict; 415 media type;
+        422 invalid specification; 429 rate limit; 502 invalid cached metrics;
+        503 unavailable dependency or ambiguous commit (retry same key).
+      headers:
+        X-Request-ID:
+          schema: {$ref: '#/components/schemas/UUID'}
+        Retry-After:
+          schema: {type: string}
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: object
+                required: [code, request_id]
+                additionalProperties: false
+                properties:
+                  code: {type: string, maxLength: 64}
+                  request_id: {$ref: '#/components/schemas/UUID'}
+  schemas:
+    UUID:
+      type: string
+      format: uuid
+    UnsignedDecimal:
+      type: string
+      pattern: '^(0|[1-9][0-9]{0,19})$'
+      description: Exact integer bytes or minor currency units; never float.
+    BandwidthPolicy:
+      type: object
+      additionalProperties: false
+      required: [max_kbps]
+      properties:
+        min_kbps: {type: integer, format: int64, minimum: 0, maximum: 1000000000000, default: 0}
+        max_kbps: {type: integer, format: int64, minimum: 1, maximum: 1000000000000}
+        shared_pool_id: {type: string, format: uuid, nullable: true}
+        priority: {type: integer, minimum: 0, maximum: 100, default: 0}
+      description: |
+        min <= max. An omitted pool is null. Priority increases with preference;
+        priority above 50 requires bandwidth:priority:high.
+    CreateVM:
+      type: object
+      additionalProperties: false
+      required: [name, image_id, network_id, vcpus, memory_mib, root_disk_gib, bandwidth]
+      properties:
+        name: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'}
+        image_id: {$ref: '#/components/schemas/UUID'}
+        network_id: {$ref: '#/components/schemas/UUID'}
+        vcpus: {type: integer, minimum: 1, maximum: 4096}
+        memory_mib: {type: integer, minimum: 128, maximum: 16777216}
+        root_disk_gib: {type: integer, minimum: 1, maximum: 1048576}
+        bandwidth: {$ref: '#/components/schemas/BandwidthPolicy'}
+    BandwidthMetrics:
+      type: object
+      additionalProperties: false
+      required: [collected_at, stale, samples]
+      properties:
+        collected_at: {type: string, format: date-time}
+        stale: {type: boolean}
+        samples:
+          type: array
+          minItems: 1
+          maxItems: 720
+          items:
+            type: object
+            additionalProperties: false
+            required: [at, ingress_kbps, egress_kbps, egress_bytes]
+            properties:
+              at: {type: string, format: date-time}
+              ingress_kbps: {type: number, minimum: 0}
+              egress_kbps: {type: number, minimum: 0}
+              egress_bytes: {$ref: '#/components/schemas/UnsignedDecimal'}
+    ResourceTotals:
+      type: object
+      required: [vcpus, memory_mib, disk_gib, min_kbps]
+      properties:
+        vms: {$ref: '#/components/schemas/UnsignedDecimal'}
+        vcpus: {$ref: '#/components/schemas/UnsignedDecimal'}
+        memory_mib: {$ref: '#/components/schemas/UnsignedDecimal'}
+        disk_gib: {$ref: '#/components/schemas/UnsignedDecimal'}
+        min_kbps: {$ref: '#/components/schemas/UnsignedDecimal'}
+    NodeMetrics:
+      type: object
+      required: [collected_at, stale, physical, reserved, cpu_usage_percent, memory_used_bytes, disk_used_bytes]
+      properties:
+        collected_at: {type: string, format: date-time}
+        stale: {type: boolean}
+        physical: {$ref: '#/components/schemas/ResourceTotals'}
+        reserved: {$ref: '#/components/schemas/ResourceTotals'}
+        cpu_usage_percent: {type: number, minimum: 0, maximum: 100}
+        memory_used_bytes: {$ref: '#/components/schemas/UnsignedDecimal'}
+        disk_used_bytes: {$ref: '#/components/schemas/UnsignedDecimal'}
+    QuotaSnapshot:
+      type: object
+      required: [collected_at, stale, limits, reserved]
+      properties:
+        collected_at: {type: string, format: date-time}
+        stale: {type: boolean}
+        limits: {$ref: '#/components/schemas/ResourceTotals'}
+        reserved: {$ref: '#/components/schemas/ResourceTotals'}
+    Dashboard:
+      type: object
+      required: [collected_at, stale, vm_counts, quotas, remaining_traffic_bytes, pending_tasks]
+      properties:
+        collected_at: {type: string, format: date-time}
+        stale: {type: boolean}
+        vm_counts:
+          type: object
+          additionalProperties: {type: integer, minimum: 0}
+        quotas: {$ref: '#/components/schemas/QuotaSnapshot'}
+        remaining_traffic_bytes: {$ref: '#/components/schemas/UnsignedDecimal'}
+        pending_tasks: {type: integer, minimum: 0}
+    TrafficPackage:
+      type: object
+      required: [id, order_id, total_bytes, remaining_bytes, purchased_at, expires_at]
+      properties:
+        id: {$ref: '#/components/schemas/UUID'}
+        order_id: {$ref: '#/components/schemas/UUID'}
+        total_bytes: {$ref: '#/components/schemas/UnsignedDecimal'}
+        remaining_bytes: {$ref: '#/components/schemas/UnsignedDecimal'}
+        purchased_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    PortForwardingInput:
+      type: object
+      additionalProperties: false
+      required: [public_ip_id, protocol, external_port, internal_port]
+      properties:
+        public_ip_id: {$ref: '#/components/schemas/UUID'}
+        protocol: {type: string, enum: [tcp, udp]}
+        external_port: {type: integer, minimum: 1, maximum: 65535}
+        internal_port: {type: integer, minimum: 1, maximum: 65535}
+    SecurityRule:
+      type: object
+      additionalProperties: false
+      required: [direction, ethertype, protocol, remote_cidr]
+      properties:
+        direction: {type: string, enum: [ingress, egress]}
+        ethertype: {type: integer, enum: [4, 6]}
+        protocol: {type: string, enum: [any, tcp, udp, icmp, icmpv6]}
+        remote_cidr: {type: string, maxLength: 43}
+        port_from: {type: integer, minimum: 1, maximum: 65535}
+        port_to: {type: integer, minimum: 1, maximum: 65535}
+        icmp_type: {type: integer, minimum: 0, maximum: 255}
+        icmp_code: {type: integer, minimum: 0, maximum: 255}
+      description: |
+        Validate CIDR with netip; family must match ethertype.
+        TCP/UDP require both ports, port_from <= port_to, no ICMP fields.
+        Other protocols forbid ports; only ICMP protocols allow ICMP fields.
+        ICMP is IPv4, ICMPv6 is IPv6. All rules are allow; default deny.
+    Task:
+      type: object
+      additionalProperties: false
+      required: [id, state, kind, progress, safe_result]
+      properties:
+        id: {$ref: '#/components/schemas/UUID'}
+        state: {type: string, enum: [pending, running, succeeded, failed, unknown, cancelled]}
+        kind: {type: string}
+        progress: {type: integer, minimum: 0, maximum: 100}
+        error_code: {type: string, nullable: true}
+        safe_result:
+          type: object
+          description: Kind-specific allowlisted identifiers/status; never payloads or secrets.
+    AuditLog:
+      type: object
+      additionalProperties: false
+      required: [id, actor_id, request_id, action, resource_type, resource_id, outcome, created_at]
+      properties:
+        id: {$ref: '#/components/schemas/UUID'}
+        actor_id: {$ref: '#/components/schemas/UUID'}
+        request_id: {$ref: '#/components/schemas/UUID'}
+        action: {type: string}
+        resource_type: {type: string}
+        resource_id: {$ref: '#/components/schemas/UUID'}
+        outcome: {type: string, enum: [accepted, denied, failed, completed]}
+        created_at: {type: string, format: date-time}
