@@ -33,7 +33,7 @@ die()   { echo "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 # ---------------- 默认值 ----------------
 ROLE="menu"
-VERSION="${KC_VERSION:-v0.2.1}"
+VERSION="${KC_VERSION:-v0.3.0}"
 KC_MIRROR="${KC_MIRROR:-auto}"           # auto | gitee | github
 SWAP_MIRRORS=true
 CONTROL_ADDR=""; JOIN_TOKEN=""; NODE_NAME="$(hostname 2>/dev/null || echo node)"; NO_DEPS=false
@@ -60,7 +60,7 @@ usage() {
   --token TOKEN         节点注册令牌（agent 必填；主控上 cat /etc/cloud/join-token）
   --node-name NAME      节点名（默认 $(hostname)）
   --mirror SRC          下载通道：gitee | github（默认 auto 探测）
-  --version VER         发行版本（默认 v0.2.1）
+  --version VER         发行版本（默认 v0.3.0）
   --no-deps             路过系统依赖安装
   --no-mirror-swap      不替换国内镜像源
   --db-password PASS    自动建库口令（默认随机生成）
